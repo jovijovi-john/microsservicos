@@ -2,15 +2,23 @@
 
 ## 📋 Visão Geral
 
-Este projeto demonstra uma arquitetura de **microsserviços** onde dois serviços independentes geram URLs de imagens aleatórias e as enviam para um backend principal através de **filas de mensageria (RabbitMQ)**. O sistema é totalmente containerizado usando Docker e desenvolvido em TypeScript.
+Este projeto demonstra uma arquitetura híbrida de **microsserviços** que combina:
+- **Comunicação assíncrona** via **filas de mensageria (RabbitMQ)** - dois microsserviços geram imagens
+- **Comunicação síncrona** via **gRPC** - dois servidores gRPC (Python e Node.js) fornecem imagens
+- **Backend agregador** que consome ambas as fontes e expõe uma API REST unificada
+- **Frontend** com tema dark que exibe todas as imagens com filtros por origem
+
+O sistema é totalmente containerizado usando Docker e desenvolvido em TypeScript e Python.
 
 ## 🏗️ Arquitetura do Sistema
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        FRONTEND                             │
-│                  (index.html)                              │
+│                  (index.html - Dark Theme)                  │
 │  Interface web que consome a API REST do Backend           │
+│  • Filtros por origem (Fila, gRPC, MS1, MS2, etc.)        │
+│  • Estatísticas em tempo real                              │
 └──────────────────────┬──────────────────────────────────────┘
                        │ HTTP/REST
                        │ GET /api/imagens
@@ -20,31 +28,66 @@ Este projeto demonstra uma arquitetura de **microsserviços** onde dois serviço
 │              (Express + TypeScript)                         │
 │  • API REST (porta 8080)                                    │
 │  • Consome mensagens do RabbitMQ                            │
-│  • Armazena imagens em memória                              │
+│  • Faz requisições HTTP ao api_grpc                         │
+│  • Combina imagens da fila + gRPC                           │
+│  • Armazena imagens da fila em memória                      │
 └──────┬──────────────────────────────┬───────────────────────┘
        │                              │
-       │ Consome                      │ Consome
-       │ Fila: imagens_microsservico1 │ Fila: imagens_microsservico2
+       │ Consome                      │ HTTP/REST
+       │ Fila: imagens_microsservico1 │ GET /getImages
+       │ Fila: imagens_microsservico2 │
        ▼                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    RABBITMQ                                 │
 │              (Message Broker)                               │
 │  • Gerencia filas de mensagens                             │
-│  • Desacopla comunicação entre serviços                    │
+│  • Desacopla comunicação entre serviços                   │
 └──────┬──────────────────────────────┬───────────────────────┘
        │                              │
-       │ Publica                      │ Publica
-       │ Fila: imagens_microsservico1 │ Fila: imagens_microsservico2
+       │ Publica                      │
+       │ Fila: imagens_microsservico1 │
+       │ Fila: imagens_microsservico2 │
+       ▼                              │
+┌──────────────────────────┐          │
+│   MICROSSERVIÇO 1        │          │
+│   (TypeScript)           │          │
+│                           │          │
+│ • Gera URLs de imagens   │          │
+│   a cada 3 segundos      │          │
+│ • Tamanhos: 400x300,      │          │
+│   500x400, 600x500       │          │
+│ • Envia para RabbitMQ    │          │
+└──────────────────────────┘          │
+                                      │
+┌──────────────────────────┐          │
+│   MICROSSERVIÇO 2        │          │
+│   (TypeScript)           │          │
+│                           │          │
+│ • Gera URLs de imagens   │          │
+│   a cada 4 segundos      │          │
+│ • Tamanhos: 800x600,      │          │
+│   700x500, 900x700      │          │
+│ • Envia para RabbitMQ    │          │
+└──────────────────────────┘          │
+                                      │
+┌─────────────────────────────────────────────────────────────┐
+│                    API gRPC CLIENT                          │
+│              (Express + TypeScript)                         │
+│  • Porta 3002                                              │
+│  • Consome servidores gRPC                                  │
+│  • Expõe endpoint HTTP /getImages                           │
+└──────┬──────────────────────────────┬───────────────────────┘
+       │                              │
+       │ gRPC                         │ gRPC
+       │ GetImage()                   │ GetImage()
        ▼                              ▼
 ┌──────────────────────────┐  ┌──────────────────────────┐
-│   MICROSSERVIÇO 1        │  │   MICROSSERVIÇO 2        │
-│   (TypeScript)           │  │   (TypeScript)           │
+│   SERVIDOR gRPC PYTHON   │  │   SERVIDOR gRPC NODE.JS   │
+│   (Python)               │  │   (TypeScript)            │
 │                           │  │                           │
-│ • Gera URLs de imagens   │  │ • Gera URLs de imagens   │
-│   a cada 3 segundos      │  │   a cada 4 segundos      │
-│ • Tamanhos: 400x300,      │  │ • Tamanhos: 800x600,     │
-│   500x400, 600x500       │  │   700x500, 900x700      │
-│ • Envia para RabbitMQ    │  │ • Envia para RabbitMQ    │
+│ • Porta 50051            │  │ • Porta 50052             │
+│ • Retorna URLs de imagens │  │ • Retorna URLs de imagens │
+│ • Implementa ImageService │  │ • Implementa ImageService │
 └──────────────────────────┘  └──────────────────────────┘
 ```
 
@@ -90,47 +133,99 @@ Este projeto demonstra uma arquitetura de **microsserviços** onde dois serviço
   4. Loga a recepção da imagem
 - Se houver erro no processamento, envia **NACK** (negative acknowledgment)
 
-### 4. Exposição via API REST (Backend)
+### 4. Comunicação gRPC
+
+**Servidores gRPC:**
+- **Python (porta 50051)**: Implementa `ImageService.GetImage()` e retorna URLs de imagens
+- **Node.js (porta 50052)**: Implementa `ImageService.GetImage()` e retorna URLs de imagens
+- Ambos usam Protocol Buffers para serialização
+
+**API gRPC Client:**
+- Consome ambos os servidores gRPC via chamadas síncronas
+- Expõe endpoint HTTP `GET /getImages` que retorna:
+  ```json
+  {
+    "python": {
+      "url": "https://picsum.photos/400/300?random=1",
+      "port": 50051
+    },
+    "node": {
+      "url": "https://picsum.photos/400/300?random=2",
+      "port": 50052
+    }
+  }
+  ```
+
+### 5. Agregação no Backend
+
+O backend agora:
+- Consome mensagens do RabbitMQ (assíncrono)
+- Faz requisições HTTP ao `api_grpc` para obter imagens do gRPC (síncrono)
+- Combina ambas as fontes em uma resposta unificada
+- Armazena apenas imagens da fila em memória (imagens gRPC são buscadas em tempo real)
+
+### 6. Exposição via API REST (Backend)
 
 O backend expõe três endpoints:
 
 **GET /api/imagens**
-- Retorna todas as imagens recebidas de ambos os microsserviços
+- Retorna todas as imagens (fila + gRPC)
 - Resposta:
   ```json
   {
-    "total": 50,
+    "total": 52,
     "imagens": [
       {
         "url": "https://picsum.photos/400/300?random=1234",
         "origem": "microsservico1",
         "timestamp": "2024-01-15T10:30:00.000Z"
       },
+      {
+        "url": "https://picsum.photos/400/300?random=1",
+        "origem": "grpc_python",
+        "timestamp": "2024-01-15T10:30:01.000Z"
+      },
+      {
+        "url": "https://picsum.photos/400/300?random=2",
+        "origem": "grpc_node",
+        "timestamp": "2024-01-15T10:30:01.000Z"
+      },
       ...
-    ]
+    ],
+    "imagensFila": [...],
+    "imagensGrpc": [...]
   }
   ```
 
 **GET /api/imagens/:origem**
-- Filtra imagens por microsserviço (`microsservico1` ou `microsservico2`)
-- Exemplo: `GET /api/imagens/microsservico1`
-- Resposta similar, mas apenas com imagens do microsserviço especificado
+- Filtra imagens por origem
+- Origens disponíveis: `microsservico1`, `microsservico2`, `grpc_python`, `grpc_node`
+- Exemplo: `GET /api/imagens/grpc_python`
+- Resposta similar, mas apenas com imagens da origem especificada
 
 **DELETE /api/imagens**
-- Limpa todas as imagens armazenadas em memória
+- Limpa todas as imagens da fila armazenadas em memória
+- Não afeta imagens do gRPC (são buscadas em tempo real)
 - Útil para testes e reset do sistema
 
-### 5. Visualização (Frontend)
+### 7. Visualização (Frontend)
 
-- Interface web em HTML/CSS/JavaScript puro
+- Interface web em HTML/CSS/JavaScript puro com **tema dark** (preto e branco)
 - Faz requisições HTTP ao backend
 - Exibe as imagens em um grid responsivo
 - Funcionalidades:
-  - **Carregar Imagens**: Busca todas as imagens do backend
-  - **Filtrar por Microsserviço**: Mostra apenas imagens de MS1 ou MS2
+  - **Carregar Todas**: Busca todas as imagens do backend (fila + gRPC)
+  - **Filtros por Origem**: 
+    - Apenas MS1 (Microsserviço 1)
+    - Apenas MS2 (Microsserviço 2)
+    - Apenas gRPC Python
+    - Apenas gRPC Node
+    - Apenas Fila (todas as imagens do RabbitMQ)
+    - Apenas gRPC (todas as imagens do gRPC)
   - **Auto-refresh**: Atualiza automaticamente a cada 2 segundos
-  - **Limpar Galeria**: Remove todas as imagens do backend
-  - **Estatísticas**: Mostra total de imagens e contagem por microsserviço
+  - **Limpar Galeria**: Remove todas as imagens da fila do backend
+  - **Estatísticas**: Mostra total de imagens, imagens da fila, imagens do gRPC, e contagem por origem
+  - **Badges visuais**: Identificação visual por origem (MS1, MS2, gRPC Python, gRPC Node)
 
 ## 🛠️ Tecnologias Utilizadas
 
@@ -146,6 +241,14 @@ O backend expõe três endpoints:
   - Gerencia filas de mensagens
   - Garante entrega das mensagens
   - Permite desacoplamento entre serviços
+  - Comunicação assíncrona
+
+### Comunicação RPC
+- **gRPC**: Framework de comunicação RPC de alto desempenho
+  - Comunicação síncrona
+  - Protocol Buffers para serialização eficiente
+  - Suporte a múltiplas linguagens (Python e Node.js)
+  - Tipagem forte via arquivos `.proto`
 
 ### Containerização
 - **Docker**: Containerização dos serviços
@@ -154,8 +257,9 @@ O backend expõe três endpoints:
 
 ### Frontend
 - **HTML5**: Estrutura
-- **CSS3**: Estilização moderna com gradientes e animações
+- **CSS3**: Estilização moderna com tema dark (preto e branco)
 - **JavaScript (Vanilla)**: Lógica do cliente sem frameworks
+- **Fetch API**: Para requisições HTTP assíncronas
 
 ## 🔐 Comunicação entre Serviços
 
@@ -164,15 +268,21 @@ O backend expõe três endpoints:
 Todos os serviços estão na mesma rede Docker (`microsservicos-network`):
 
 - **Backend** → RabbitMQ: `amqp://rabbitmq:5672`
+- **Backend** → API gRPC: `http://api_grpc:3000`
 - **Microsserviço 1** → RabbitMQ: `amqp://rabbitmq:5672`
 - **Microsserviço 2** → RabbitMQ: `amqp://rabbitmq:5672`
+- **API gRPC** → Server gRPC Python: `server_grpc_python:50051`
+- **API gRPC** → Server gRPC Node.js: `server_grpc_node:50052`
 - **Frontend** → Backend: `http://localhost:8080`
 
-O nome `rabbitmq` é resolvido pelo Docker DNS interno, permitindo comunicação entre containers sem expor portas desnecessariamente.
+Os nomes dos serviços são resolvidos pelo Docker DNS interno, permitindo comunicação entre containers sem expor portas desnecessariamente.
 
 ### Portas Expostas
 
 - **8080**: Backend API (mapeada da porta 3000 interna)
+- **3002**: API gRPC Client (mapeada da porta 3000 interna)
+- **50051**: Servidor gRPC Python
+- **50052**: Servidor gRPC Node.js
 - **15673**: RabbitMQ Management UI (mapeada da porta 15672 interna)
 - **5672**: Não exposta externamente (apenas comunicação interna)
 
@@ -216,12 +326,17 @@ docker compose down
 ### Fluxo de Inicialização
 
 1. **RabbitMQ** inicia primeiro (health check configurado)
-2. Quando RabbitMQ está saudável, **Backend** e **Microsserviços** iniciam
-3. Cada microsserviço conecta ao RabbitMQ e cria sua fila
-4. Backend conecta ao RabbitMQ e começa a consumir mensagens
-5. Microsserviços começam a gerar e enviar imagens
-6. Backend recebe e armazena as imagens
-7. Frontend pode consultar a API para visualizar
+2. **Servidores gRPC** (Python e Node.js) iniciam
+3. **API gRPC Client** inicia e conecta aos servidores gRPC
+4. Quando RabbitMQ está saudável, **Backend** e **Microsserviços** iniciam
+5. Cada microsserviço conecta ao RabbitMQ e cria sua fila
+6. Backend conecta ao RabbitMQ e começa a consumir mensagens
+7. Backend também está pronto para fazer requisições ao api_grpc
+8. Microsserviços começam a gerar e enviar imagens para RabbitMQ
+9. Backend recebe mensagens do RabbitMQ e armazena em memória
+10. Quando o frontend faz requisição, o backend busca imagens do gRPC em tempo real
+11. Backend combina imagens da fila + gRPC e retorna ao frontend
+12. Frontend exibe todas as imagens com filtros e estatísticas
 
 ## 📝 Estrutura de Mensagens
 
@@ -239,7 +354,7 @@ docker compose down
 
 ```json
 {
-  "total": 25,
+  "total": 27,
   "imagens": [
     {
       "url": "https://picsum.photos/400/300?random=7151",
@@ -247,9 +362,43 @@ docker compose down
       "timestamp": "2024-01-15T10:30:00.000Z"
     },
     {
-      "url": "https://source.unsplash.com/random/800x600",
+      "url": "https://picsum.photos/800/600?random=1234",
       "origem": "microsservico2",
       "timestamp": "2024-01-15T10:30:04.000Z"
+    },
+    {
+      "url": "https://picsum.photos/400/300?random=1",
+      "origem": "grpc_python",
+      "timestamp": "2024-01-15T10:30:05.000Z"
+    },
+    {
+      "url": "https://picsum.photos/400/300?random=2",
+      "origem": "grpc_node",
+      "timestamp": "2024-01-15T10:30:05.000Z"
+    }
+  ],
+  "imagensFila": [
+    {
+      "url": "https://picsum.photos/400/300?random=7151",
+      "origem": "microsservico1",
+      "timestamp": "2024-01-15T10:30:00.000Z"
+    },
+    {
+      "url": "https://picsum.photos/800/600?random=1234",
+      "origem": "microsservico2",
+      "timestamp": "2024-01-15T10:30:04.000Z"
+    }
+  ],
+  "imagensGrpc": [
+    {
+      "url": "https://picsum.photos/400/300?random=1",
+      "origem": "grpc_python",
+      "timestamp": "2024-01-15T10:30:05.000Z"
+    },
+    {
+      "url": "https://picsum.photos/400/300?random=2",
+      "origem": "grpc_node",
+      "timestamp": "2024-01-15T10:30:05.000Z"
     }
   ]
 }
@@ -257,9 +406,9 @@ docker compose down
 
 ## ⚠️ Limitações e Considerações
 
-1. **Armazenamento em Memória**: As imagens são armazenadas apenas em memória. Ao reiniciar o backend, todas as imagens são perdidas.
+1. **Armazenamento em Memória**: As imagens da fila são armazenadas apenas em memória. Ao reiniciar o backend, essas imagens são perdidas. As imagens do gRPC são buscadas em tempo real a cada requisição.
 
-2. **Sem Persistência**: Para produção, seria necessário um banco de dados (PostgreSQL, MongoDB, etc.) para persistir as imagens.
+2. **Sem Persistência**: Para produção, seria necessário um banco de dados (PostgreSQL, MongoDB, etc.) para persistir as imagens da fila.
 
 3. **Sem Autenticação**: A API não possui autenticação/autorização. Em produção, seria necessário implementar segurança.
 
@@ -267,20 +416,30 @@ docker compose down
 
 5. **Monitoramento**: Logs básicos estão implementados, mas para produção seria necessário um sistema de monitoramento mais robusto (Prometheus, Grafana, etc.).
 
+6. **Comunicação Híbrida**: O sistema combina comunicação assíncrona (RabbitMQ) e síncrona (gRPC), demonstrando diferentes padrões de comunicação em microsserviços.
+
+7. **Tema Dark**: O frontend possui tema dark (preto e branco) para melhor experiência visual.
+
 ## 🎯 Casos de Uso
 
 Este projeto demonstra:
-- Arquitetura de microsserviços
-- Comunicação assíncrona via mensageria
+- Arquitetura híbrida de microsserviços
+- Comunicação assíncrona via mensageria (RabbitMQ)
+- Comunicação síncrona via gRPC
+- Agregação de múltiplas fontes de dados
 - Desacoplamento de serviços
 - Containerização com Docker
 - TypeScript em projetos Node.js
+- Python em serviços gRPC
+- Protocol Buffers para serialização
 - API REST com Express
-- Frontend simples e funcional
+- Frontend com tema dark e filtros avançados
 
 É ideal para:
 - Aprendizado de arquitetura de microsserviços
-- Demonstração de conceitos de mensageria
+- Demonstração de diferentes padrões de comunicação (assíncrona e síncrona)
+- Comparação entre RabbitMQ e gRPC
 - Base para projetos mais complexos
 - Prototipagem rápida de sistemas distribuídos
+- Estudo de integração de múltiplas tecnologias
 
