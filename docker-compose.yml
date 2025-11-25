@@ -1,0 +1,133 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # INFRAESTRUTURA
+  # ============================================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "15673:15672" # Porta Management UI (mudada para evitar conflito)
+      # Porta 5672 não é exposta externamente - serviços Docker se comunicam pela rede interna
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  # ============================================
+  # SERVIDORES gRPC
+  # ============================================
+  server_grpc_python:
+    build:
+      context: .
+      dockerfile: server_grpc_python/Dockerfile
+    container_name: server_grpc_python
+    ports:
+      - "50051:50051"
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  server_grpc_node:
+    build:
+      context: .
+      dockerfile: server_grpc_node/Dockerfile
+    container_name: server_grpc_node
+    ports:
+      - "50052:50052"
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  # ============================================
+  # API gRPC CLIENT
+  # ============================================
+  api_grpc:
+    build:
+      context: ./api_grpc
+      dockerfile: Dockerfile
+    container_name: api_grpc
+    ports:
+      - "3002:3000"
+    environment:
+      PORT: 3000
+      PYTHON_GRPC_HOST: server_grpc_python
+      NODE_GRPC_HOST: server_grpc_node
+    depends_on:
+      - server_grpc_python
+      - server_grpc_node
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  # ============================================
+  # BACKEND PRINCIPAL
+  # ============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend
+    ports:
+      - "8080:3000"
+    environment:
+      PORT: 3000
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      API_GRPC_URL: http://api_grpc:3000
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      api_grpc:
+        condition: service_started
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  # ============================================
+  # MICROSSERVIÇOS (RabbitMQ)
+  # ============================================
+  microsservico1:
+    build:
+      context: ./microsservico1
+      dockerfile: Dockerfile
+    container_name: microsservico1
+    environment:
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+  microsservico2:
+    build:
+      context: ./microsservico2
+      dockerfile: Dockerfile
+    container_name: microsservico2
+    environment:
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - microsservicos-network
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:
+
+networks:
+  microsservicos-network:
+    driver: bridge
+
